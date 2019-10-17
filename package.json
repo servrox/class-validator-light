@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.1",
   "description": "Lightweight class-based validation with Typescript / ES6 / ES5 using decorators or validation schemas. Supports both node.js and browser",
-  "license": "Beerware",
+  "license": "MIT",
   "readmeFilename": "README.md",
   "author": {
     "name": "Marcel Mayer",

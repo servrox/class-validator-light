@@ -1,0 +1,176 @@
+name: Security Baseline
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: "37 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: security-baseline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  osv:
+    name: OSV vulnerability scan
+    runs-on: ${{ vars['SUPPLY_CHAIN_SENTINEL_RUNNER'] || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run OSV-Scanner
+        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+        with:
+          scan-args: |-
+            --recursive
+            ./
+
+  secrets:
+    name: Secret scan
+    runs-on: ${{ vars['SUPPLY_CHAIN_SENTINEL_RUNNER'] || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@37b77001d0174ebec2fcca2bd83ff83a6d45a3ab # v3.95.3
+        with:
+          extra_args: --results=verified,unknown
+          path: ./
+          version: 3.95.3
+
+  workflow-lint:
+    name: GitHub Actions lint
+    runs-on: ${{ vars['SUPPLY_CHAIN_SENTINEL_RUNNER'] || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          cache: false
+          go-version: stable
+
+      - name: Run actionlint
+        run: |
+          if [ -d .github/workflows ]; then
+            go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 \
+              -ignore 'unknown permission scope "vulnerability-alerts"'
+          fi
+
+  workflow-security:
+    name: GitHub Actions security lint
+    runs-on: ${{ vars['SUPPLY_CHAIN_SENTINEL_RUNNER'] || 'ubuntu-latest' }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: false
+
+      - name: Run zizmor
+        run: |
+          for attempt in 1 2 3; do
+            set +e
+            uvx --from zizmor==1.24.1 zizmor \
+              --persona=auditor \
+              --format=github \
+              --min-severity=high \
+              --min-confidence=medium \
+              --color=always \
+              -- ./
+            status="$?"
+            set -e
+
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+
+            if [ "$status" -eq 3 ]; then
+              echo "::warning::No inputs were collected by zizmor"
+              exit 0
+            fi
+
+            if [ "$status" -ge 11 ]; then
+              exit "$status"
+            fi
+
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$((attempt * 15))"
+              continue
+            fi
+
+            exit "$status"
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  summary:
+    name: Security Baseline summary
+    needs:
+      - osv
+      - secrets
+      - workflow-lint
+      - workflow-security
+    if: ${{ always() }}
+    runs-on: ${{ vars['SUPPLY_CHAIN_SENTINEL_RUNNER'] || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Summarize security baseline checks
+        env:
+          OSV_RESULT: ${{ needs.osv.result }}
+          SECRETS_RESULT: ${{ needs.secrets.result }}
+          WORKFLOW_LINT_RESULT: ${{ needs['workflow-lint'].result }}
+          WORKFLOW_SECURITY_RESULT: ${{ needs['workflow-security'].result }}
+        run: |
+          format_result() {
+            case "$1" in
+              success) printf '%s' "✅ success" ;;
+              skipped) printf '%s' "⏭️ skipped" ;;
+              cancelled) printf '%s' "⚠️ cancelled" ;;
+              *) printf '%s' "❌ $1" ;;
+            esac
+          }
+
+          {
+            echo "## Security Baseline"
+            echo ""
+            echo "| Check | Purpose | Result |"
+            echo "| --- | --- | --- |"
+            echo "| OSV vulnerability scan | Dependency advisory scan across the repository | $(format_result "$OSV_RESULT") |"
+            echo "| Secret scan | Verified and unknown secret detection with TruffleHog | $(format_result "$SECRETS_RESULT") |"
+            echo "| GitHub Actions lint | Workflow syntax and shell lint via actionlint | $(format_result "$WORKFLOW_LINT_RESULT") |"
+            echo "| GitHub Actions security lint | High-severity workflow security findings via zizmor | $(format_result "$WORKFLOW_SECURITY_RESULT") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$OSV_RESULT" != "success" ] ||
+            [ "$SECRETS_RESULT" != "success" ] ||
+            [ "$WORKFLOW_LINT_RESULT" != "success" ] ||
+            [ "$WORKFLOW_SECURITY_RESULT" != "success" ]; then
+            exit 1
+          fi
